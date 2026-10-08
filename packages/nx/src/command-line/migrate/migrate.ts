@@ -1413,9 +1413,7 @@ export async function parseMigrationsOptions(
         `Error: '--step-action' cannot be combined with '--run-migrations'.`
       );
     }
-    // A bare '--run-id' reconciles the run it names. Ungated, unlike init:
-    // the id has to name a run directory that exists, and only a gated init
-    // ever creates one.
+    // A bare '--run-id' reconciles the run it names.
     // yargs' choices already reject bad CLI values; this guards programmatic
     // callers, where silently dropping the action would reconcile without it.
     if (options.stepAction !== undefined && !isStepAction(options.stepAction)) {
@@ -3249,7 +3247,7 @@ export async function executeMigrations(
 }
 
 function orchestratorFlagNeedsOrchestrator(flag: string): string {
-  return `'${flag}' acts on an orchestrated migrate run (NX_MIGRATE_ORCHESTRATOR=true with an enabled agent), and this invocation is not orchestrated.`;
+  return `'${flag}' acts on an orchestrated migrate run, and this invocation is not orchestrated. Orchestration needs an enabled agent, or an AI agent running nx outside CI; --agentic=false and the WASM build turn it off.`;
 }
 
 // nx is located at spawn time, after the gated pre-install, so the child runs
@@ -3286,9 +3284,12 @@ async function runMigrations(
   commitPrefix: string,
   shouldSkipInstall = false
 ) {
-  // Both flags act on an orchestrated run: refuse them where none can run
-  // (an explicit --agentic=false outside an agent cannot reach one either),
-  // before the install and before --if-exists could return silently.
+  // The WASM build lacks the native locks a durable run relies on.
+  const outerAgentDrivesRun =
+    isInsideAgent() && opts.agentic !== false && !isCI() && !IS_WASM;
+  // Both flags act on an orchestrated run: refuse them before the install, and
+  // before --if-exists could return silently, when neither the outer agent nor
+  // a master session (an agent enabled outside one, off WASM) can drive it.
   const orchestratorFlag =
     opts.startFresh === true
       ? '--start-fresh'
@@ -3297,8 +3298,8 @@ async function runMigrations(
         : undefined;
   if (
     orchestratorFlag !== undefined &&
-    (process.env.NX_MIGRATE_ORCHESTRATOR !== 'true' ||
-      (opts.agentic === false && !isInsideAgent()))
+    !outerAgentDrivesRun &&
+    (isInsideAgent() || opts.agentic === false || IS_WASM)
   ) {
     throw new Error(orchestratorFlagNeedsOrchestrator(orchestratorFlag));
   }
@@ -3399,7 +3400,7 @@ async function runMigrations(
   // the classic loop: init starts a fresh run or reports an already-active
   // one; `--run-id` continues that run. Bare `--run-id` reconciles are
   // dispatched separately and never reach here.
-  if (process.env.NX_MIGRATE_ORCHESTRATOR === 'true' && isInsideAgent()) {
+  if (outerAgentDrivesRun) {
     const { runOrchestratorInit, runOrchestratorResume } =
       require('./run') as typeof import('./run');
     // Orchestrated runs are agent-driven, so commits default on exactly as they
@@ -3484,6 +3485,15 @@ async function runMigrations(
     reportMigrateRunError({ code: 'agentic', error: e });
     throw e;
   }
+  // Resolved before the commit policy, which defaults on only for an agent.
+  if (agentic.kind === 'enabled' && IS_WASM) {
+    output.warn({
+      title:
+        'Skipping the agentic flow: it needs the native nx binary, and this run loaded the WASM build.',
+      bodyLines: ['Continuing the migration without the agentic flow.'],
+    });
+    agentic = { kind: 'disabled' };
+  }
 
   const {
     effective: effectiveCreateCommits,
@@ -3511,14 +3521,8 @@ async function runMigrations(
     !canPrompt(opts.interactive) ||
     confirmMigrationCommitsOnDefaultBranch(root, 'running migrations');
 
-  // Dark: with the env var set, the agent drives the whole run through the
-  // orchestrator from one session instead of being spawned per step. Not
-  // under WASM, where the broker has no native lock to detect a dead parent.
-  if (
-    agentic.kind === 'enabled' &&
-    process.env.NX_MIGRATE_ORCHESTRATOR === 'true' &&
-    !IS_WASM
-  ) {
+  // The agent drives the whole run through the orchestrator from one session.
+  if (agentic.kind === 'enabled') {
     const init = orchestratorInitInput(effectiveCreateCommits);
     const { runMasterSession } =
       require('./agentic/master/run-master-session') as typeof import('./agentic/master/run-master-session');
@@ -3554,22 +3558,6 @@ async function runMigrations(
 
   if (effectiveCreateCommits) {
     commitCheckpointBeforeMigrations(root, commitPrefix);
-  }
-
-  if (agentic.kind === 'enabled') {
-    const { applyAgenticHandoffGitignoreFallback } =
-      require('./agentic/handoff-gitignore') as typeof import('./agentic/handoff-gitignore');
-    const { packageJson: nxPackageJson } = readModulePackageJson(
-      'nx',
-      getNxRequirePaths(root)
-    );
-    await applyAgenticHandoffGitignoreFallback({
-      migrations,
-      installedNxVersion: nxPackageJson.version,
-      effectiveCreateCommits,
-      commitPrefix,
-      root,
-    });
   }
 
   const {
@@ -3689,8 +3677,6 @@ async function runMigrations(
 
   reportMigrateRunComplete({
     agenticOutcome: agentic.kind,
-    agentUsed:
-      agentic.kind === 'enabled' ? agentic.selectedAgent.id : undefined,
     migrationCount: migrations.length,
     appliedCount,
   });
