@@ -8,6 +8,7 @@ export {
   writeRunState,
   findActiveRun,
   createRun,
+  unsafeMigrationIds,
 } from './run-state';
 export type {
   MigrateRunStatus,
