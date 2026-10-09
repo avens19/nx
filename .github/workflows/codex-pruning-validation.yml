@@ -1,0 +1,48 @@
+name: Pruning contribution validation
+on:
+  push:
+    branches: [codex/pruned-pnpm-build-selectors-checks]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CI: 'true'
+      NX_DAEMON: 'false'
+      NX_ISOLATE_PLUGINS: 'false'
+      NX_PARALLEL: '1'
+      NX_NO_CLOUD: 'true'
+      NODE_OPTIONS: --max-old-space-size=2048
+      RAYON_NUM_THREADS: '1'
+      CARGO_BUILD_JOBS: '1'
+      PNPM_CONFIG_CHILD_CONCURRENCY: '1'
+      PNPM_CONFIG_NETWORK_CONCURRENCY: '4'
+      PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '24'
+      - run: corepack enable
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Focused pruning regression tests
+        run: pnpm exec vitest run packages/nx/src/plugins/js/lock-file/pruned-output.spec.ts packages/nx/src/plugins/js/lock-file/pnpm-parser.spec.ts packages/nx/src/plugins/js/lock-file/lock-file.spec.ts --config packages/nx/vitest.config.mts --maxWorkers=1
+      - name: Format changed sources
+        run: pnpm exec oxfmt --check packages/nx/src/plugins/js/lock-file/pruned-output.ts packages/nx/src/plugins/js/lock-file/pruned-output.spec.ts
+      - name: Lint changed sources
+        working-directory: packages/nx
+        run: pnpm exec eslint src/plugins/js/lock-file/pruned-output.ts src/plugins/js/lock-file/pruned-output.spec.ts --max-warnings=0
+      - name: Resolve project configuration
+        run: pnpm nx show project nx --json
+      - name: Repository prepush validation
+        run: pnpm nx prepush --parallel=1 --tui=false
